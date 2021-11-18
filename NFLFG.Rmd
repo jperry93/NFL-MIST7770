@@ -1,0 +1,252 @@
+## Metadata
+---
+title: "NFLFG"
+author: "Jackson Perry"
+date: "11/8/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r, include=FALSE, echo=FALSE}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(lubridate)
+library(readr)
+library(splitstackshape)
+library(timechange)
+```
+
+## Read csv files
+```{r, include=FALSE, echo=FALSE}
+plays <-read_csv("plays.csv")
+players <-read_csv("players.csv")
+games <- read_csv("games.csv")
+  games$gameDate <- as.Date(games$gameDate,format="%m/%d/%Y")
+  games$gameDateTimeEastern <- as.POSIXct(paste(games$gameDate, games$gameTimeEastern), 
+                                   format="%Y-%m-%d %H:%M:%S", "America/New_York")
+stadiums <-read_csv("Stadium List.csv")
+weather <- read_csv("games_weather.csv")
+```
+
+## Understand list of teams, add team numbers to games
+```{r, include=FALSE, echo=FALSE}
+games$homeTeamAbbr[games$homeTeamAbbr == "OAK"] <- "LV"  # rename OAK to LV (Okaland Raiders moved to Las Vegas)
+games$visitorTeamAbbr[games$visitorTeamAbbr == "OAK"] <- "LV"  # rename OAK to LV
+
+# Craete list of team abbreviations with unique ID
+teamlist <- data.frame(unique(games$homeTeamAbbr, incomparables = FALSE)) # a list of unique team names
+teamlist <- teamlist[order(teamlist),] # sort
+teamlist <- data.frame(teamlist) # create dataframe
+names(teamlist) <- c("team_abbreviation") #assign name to column
+getanID(teamlist, "team_abbreviation") # get an id for each row
+teamlist <- teamlist %>% mutate(team_id = row_number()) # get an id for each row
+colnames(teamlist) <- c("team_abbreviation","hometeam_ID#") # name each column
+
+games <- merge(games, teamlist, by.x = "homeTeamAbbr", by.y = "team_abbreviation", all=TRUE) # match home team
+colnames(teamlist) <- c("team_abbreviation","visitorteam_ID#") # rename for visitor team
+games <- merge(games, teamlist, by.x = "visitorTeamAbbr", by.y = "team_abbreviation", all=TRUE) # match visitor team
+```
+
+
+
+## Convert game time from EST to local time
+```{r, include=FALSE, echo=FALSE}
+games <- left_join(games, stadiums, by = c("homeTeamAbbr" = "Abbreviation"))
+games <- subset(games, select = -c(Team, Conference))
+
+## Account for games played in other venues
+webley_games = c(2018101407, 2018102100, 2018102800, 2019102706, 2019110300)
+for (i in webley_games) {
+  games$Latitude[games$gameId == i] = 51.5560247 # Webley Stadium
+  games$Longitude[games$gameId == i] = -0.2818064
+  games$ZIP[games$gameId == i] = NA
+  games$City[games$gameId == i] = "London"
+  games$State[games$gameId == i] = "ENG"
+  games$Dome[games$gameId == i] = "Open Air"
+  games$`Turf Type`[games$gameId == i] = "Natural"
+  games$`Time Zone`[games$gameId == i] = "Europe/London"
+}
+
+tottenham_games = c(2019100605, 2019101300)
+for (i in tottenham_games) {
+  games$Latitude[games$gameId == i] = 51.6042781 # Tottenham Stadium
+  games$Longitude[games$gameId == i] = -0.0662422
+  games$ZIP[games$gameId == i] = NA
+  games$City[games$gameId == i] = "London"
+  games$State[games$gameId == i] = "ENG"
+  games$Dome[games$gameId == i] = "Open Air"
+  games$`Turf Type`[games$gameId == i] = "Natural"
+  games$`Time Zone`[games$gameId == i] = "Europe/London"
+}
+
+estadio_azteca_games = c(2019111800)
+for (i in estadio_azteca_games) {
+  games$Latitude[games$gameId == i] = 19.3028607 # Estadio Azteca Stadium
+  games$Longitude[games$gameId == i] = -99.1505277
+  games$ZIP[games$gameId == i] = NA
+  games$City[games$gameId == i] = "Mexico City"
+  games$State[games$gameId == i] = "MX"
+  games$Dome[games$gameId == i] = "Open Air"
+  games$`Turf Type`[games$gameId == i] = "Natural"
+  games$`Time Zone`[games$gameId == i] = "America/Mexico_City"
+}
+
+
+games$gameTimeLocal <- NA
+  
+## Set local times for each area
+games$gameTimeLocal[games$`Time Zone` == 'America/Los_Angeles'] <- 
+    format(games$gameDateTime, tz="America/Los_Angeles")[games$`Time Zone` == 'America/Los_Angeles']
+games$gameTimeLocal[games$`Time Zone` == 'America/New_York'] <- 
+    format(games$gameDateTime, tz="America/New_York")[games$`Time Zone` == 'America/New_York']
+games$gameTimeLocal[games$`Time Zone` == 'America/Chicago'] <- 
+    format(games$gameDateTime, tz="America/Chicago")[games$`Time Zone` == 'America/Chicago']
+games$gameTimeLocal[games$`Time Zone` == 'America/Denver'] <- 
+    format(games$gameDateTime, tz="America/Denver")[games$`Time Zone` == 'America/Denver']
+games$gameTimeLocal[games$`Time Zone` == 'America/Phoenix'] <- 
+    format(games$gameDateTime, tz="America/Phoenix")[games$`Time Zone` == 'America/Phoenix']
+games$gameTimeLocal[games$`Time Zone` == 'America/Indiana/Indianapolis'] <- 
+    format(games$gameDateTime, tz="America/Indiana/Indianapolis")[games$`Time Zone` == 'America/Indiana/Indianapolis']
+games$gameTimeLocal[games$`Time Zone` == 'Europe/London'] <- 
+    format(games$gameDateTime, tz="Europe/London")[games$`Time Zone` == 'Europe/London']
+games$gameTimeLocal[games$`Time Zone` == 'America/Mexico_City'] <- 
+    format(games$gameDateTime, tz="America/Mexico_City")[games$`Time Zone` == 'America/Mexico_City']
+
+```
+
+## Join Tables and Rename
+```{r, include=FALSE, echo=FALSE}
+nflData1 <- inner_join(plays, players, by = c("kickerId" = "nflId"))
+nflData2 <- inner_join(games, nflData1, by = c("gameId" = "gameId"))
+nflData3 <- inner_join(weather, nflData2, by = c("game_id" = "gameId"))
+nflData <- nflData3
+```
+
+## Filter dataset for relevant columns
+```{r, include=FALSE, echo=FALSE}
+df <- nflData %>%
+  dplyr::select(homeTeamAbbr, visitorTeamAbbr, quarter, possessionTeam, specialTeamsPlayType, specialTeamsResult, preSnapHomeScore, preSnapVisitorScore, kickLength, birthDate, gameDate, gameClock, gameTimeEastern, height, weight, kickerId, Temperature, DewPoint, Humidity, Precipitation, WindSpeed, WindDirection, Pressure, EstimatedCondition)
+#Filter for field goals
+fgdf <- df %>%
+  filter(specialTeamsPlayType == "Field Goal")
+```
+
+#Create Home Field Advantage variable
+```{r, include=FALSE, echo=FALSE}
+#Transform variables
+fgdf <- fgdf %>%
+  mutate(homeFieldAdv = case_when(homeTeamAbbr == possessionTeam ~ 1, homeTeamAbbr != possessionTeam ~ 0))
+
+#Create Winning & Tied at Time of Attempt variables
+#Create temporary variable for dummy variable calculations
+fgdf <- fgdf %>%
+  mutate(homeUp = case_when(preSnapHomeScore > preSnapVisitorScore ~ 1,   preSnapHomeScore < preSnapVisitorScore ~ 0))
+
+#Create tied variable
+ fgdf <- fgdf %>%
+   mutate(tied = case_when(preSnapHomeScore == preSnapVisitorScore ~ 1,   preSnapHomeScore != preSnapVisitorScore ~ 0))
+ 
+#Create winning variable
+fgdf <- fgdf %>%
+  mutate(winning = case_when(homeFieldAdv <= homeUp ~ 1, 
+                             homeFieldAdv >= homeUp ~ 0)) 
+
+#If game is tied at time of attempt, winning is 0
+fgdf <- fgdf %>%
+  mutate(winning = case_when(tied == 0 ~ 1, 
+                             tied == 1 ~ 0))
+```
+
+#Create Kicker Age variable
+```{r, include=FALSE, echo=FALSE}
+#Transform variables
+#Convert char to date
+fgdf1 <- fgdf
+fgdf1 <- fgdf1 %>%
+        mutate(birthDate = as.Date(birthDate, tryFormats = c("%m/%d/%Y", "%Y-%m-%d", "$mm/$dd/$yyyy", "$m/$d/$y")))
+fgdf1 <- fgdf1 %>%
+        mutate(gameDate = as.Date(gameDate, tryFormats = c("%m/%d/%Y", "%Y-%m-%d", "$mm/$dd/$yyyy", "$m/$d/$y")))
+#Calculate years between dates for age
+fgdf1 <- fgdf1 %>%
+        mutate(kickerAge = as.numeric(difftime(birthDate,gameDate),
+                                      units = "weeks")/-52.25)
+```
+
+#Create Field Goal Completion dummy variable
+```{r, include=FALSE, echo=FALSE}
+#Transform variables
+fgdf <- fgdf %>%
+  mutate(fgComplete = case_when(specialTeamsResult == "Kick Attempt Good" ~ 1, 
+                             specialTeamsResult != "Kick Attempt Good" ~ 0)) 
+
+```
+
+#Create Quarter dummy variables
+```{r, include=FALSE, echo=FALSE}
+#Transform variables
+fgdf <- fgdf %>%
+  mutate(q1 = case_when(quarter == 1 ~ 1, 
+                             quarter != 1 ~ 0))
+fgdf <- fgdf %>%
+  mutate(q2 = case_when(quarter == 2 ~ 1, 
+                             quarter != 2 ~ 0))
+fgdf <- fgdf %>%
+  mutate(q3 = case_when(quarter == 3 ~ 1, 
+                             quarter != 3 ~ 0))
+fgdf <- fgdf %>%
+  mutate(q4 = case_when(quarter == 4 ~ 1, 
+                             quarter != 4 ~ 0))
+fgdf <- fgdf %>%
+  mutate(overtime = case_when(quarter == 5 ~ 1, 
+                             quarter != 5 ~ 0))
+
+```
+
+```{r, include=FALSE, echo=FALSE}
+#Transform variables
+#Create Estimated Condition dummy variables
+fgdf <- fgdf %>%
+  mutate(clear = case_when(EstimatedCondition == "Clear" ~ 1, 
+                             EstimatedCondition != "Clear" ~ 0))
+fgdf <- fgdf %>%
+  mutate(light_rain = case_when(EstimatedCondition == "Light Rain" ~ 1, 
+                             EstimatedCondition != "Light Rain" ~ 0))
+fgdf <- fgdf %>%
+  mutate(moderate_rain = case_when(EstimatedCondition == "Moderate Rain" ~ 1, 
+                             EstimatedCondition != "Moderate Rain" ~ 0))
+fgdf <- fgdf %>%
+  mutate(heavy_rain = case_when(EstimatedCondition == "Heavy Rain" ~ 1, 
+                             EstimatedCondition != "Heavy Rain" ~ 0))
+fgdf <- fgdf %>%
+  mutate(light_snow = case_when(EstimatedCondition == "Light Snow" ~ 1, 
+                             EstimatedCondition != "Light Snow" ~ 0))
+fgdf <- fgdf %>%
+  mutate(moderate_snow = case_when(EstimatedCondition == "Moderate Snow" ~ 1, 
+                             EstimatedCondition != "Moderate Snow" ~ 0))
+fgdf <- fgdf %>%
+  mutate(heavy_snow = case_when(EstimatedCondition == "Heavy Snow" ~ 1, 
+                             EstimatedCondition != "Heavy Snow" ~ 0))
+
+```
+
+```{r, include=FALSE, echo=FALSE}
+#Tidy the data
+#Delete non-numeric variables
+fgdf <- fgdf %>%
+  dplyr::select(-visitorTeamAbbr, -homeTeamAbbr, -EstimatedCondition, -quarter, -possessionTeam, -specialTeamsPlayType, -specialTeamsResult, -birthDate, -gameDate, -gameTimeEastern, -height, -kickerId, -homeUp, -gameClock )
+
+#Remove NAs
+fgdf <- na.omit(fgdf)
+```
+
+```{r, include=FALSE, echo=FALSE}
+#Select Predictors
+cor(fgdf[,1:28])
+```
+
